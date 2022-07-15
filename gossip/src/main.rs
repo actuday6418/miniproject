@@ -1,22 +1,23 @@
-use async_std::task;
 use eframe::egui::{self, RichText};
+use futures::channel::mpsc;
 use futures::prelude::stream::StreamExt;
 use futures::select;
-use libp2p::{
-    floodsub::{self, Floodsub, FloodsubEvent},
-    identity,
-    mdns::{Mdns, MdnsConfig, MdnsEvent},
-    swarm::SwarmEvent,
-    Multiaddr, NetworkBehaviour, PeerId, Swarm,
+
+use libp2p::gossipsub::MessageId;
+use libp2p::gossipsub::{
+    GossipsubEvent, GossipsubMessage, IdentTopic as Topic, MessageAuthenticity, ValidationMode,
 };
-use std::sync::mpsc;
+use libp2p::{gossipsub, identity, swarm::SwarmEvent, PeerId};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::time::Duration;
 
 fn main() {
     // frontend to backend
-    let (f_sender, f_reciever) = mpsc::channel();
+    let (mut f_sender, mut f_reciever) = mpsc::channel(128);
     // backend to front
-    let (b_sender, b_reciever) = mpsc::channel();
-    std::thread::spawn(|| start(f_reciever, b_sender));
+    let (mut b_sender, mut b_reciever) = mpsc::channel(128);
+    std::thread::spawn(move || async_std::task::block_on(start(&mut f_reciever, &mut b_sender)));
     eframe::run_native(
         "Gossip",
         eframe::NativeOptions::default(),
@@ -32,6 +33,7 @@ enum PacketFromBackend {
 ///used for internal communication from frontend to networking
 enum PacketFromFrontend {
     SendMessage((String, String)),
+    AddPeer(String),
 }
 
 struct Message {
@@ -47,6 +49,7 @@ struct Chat {
 
 struct MyApp {
     draft_text: String,
+    add_peer_text: String,
     chats: Vec<Chat>,
     chat_index: usize,
     reciever: mpsc::Receiver<PacketFromBackend>,
@@ -76,13 +79,16 @@ impl MyApp {
             chat_index: 0,
             sender,
             reciever,
+            add_peer_text: String::new(),
         }
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Ok(PacketFromBackend::MessageRecieved((room, message))) = self.reciever.try_recv() {
+        if let Ok(Some(PacketFromBackend::MessageRecieved((room, message)))) =
+            self.reciever.try_next()
+        {
             self.chats
                 .iter_mut()
                 .find(|x| x.chat_name == room)
@@ -117,6 +123,19 @@ impl eframe::App for MyApp {
                                 };
                                 ui.add_space(10f32);
                             }
+                            ui.label("Add peer: ");
+                            ui.horizontal(|ui| {
+                                ui.text_edit_singleline(&mut self.add_peer_text);
+
+                                if ui.button(String::from("+")).clicked() {
+                                    self.sender
+                                        .try_send(PacketFromFrontend::AddPeer(
+                                            self.add_peer_text.clone(),
+                                        ))
+                                        .unwrap();
+                                    self.add_peer_text.clear();
+                                };
+                            })
                         })
                     });
                     ui.group(|ui| {
@@ -133,7 +152,7 @@ impl eframe::App for MyApp {
                                 ui.text_edit_singleline(&mut self.draft_text);
                                 if ui.button("Send").clicked() {
                                     self.sender
-                                        .send(PacketFromFrontend::SendMessage((
+                                        .try_send(PacketFromFrontend::SendMessage((
                                             (&self.chats)[self.chat_index].chat_name.clone(),
                                             self.draft_text.clone(),
                                         )))
@@ -155,8 +174,8 @@ impl eframe::App for MyApp {
 //}
 
 async fn start(
-    reciever: mpsc::Receiver<PacketFromFrontend>,
-    sender: mpsc::Sender<PacketFromBackend>,
+    reciever: &mut mpsc::Receiver<PacketFromFrontend>,
+    sender: &mut mpsc::Sender<PacketFromBackend>,
 ) {
     // Create a random PeerId
     let local_key = identity::Keypair::generate_ed25519();
@@ -164,56 +183,40 @@ async fn start(
     println!("Local peer id: {:?}", local_peer_id);
 
     // Set up an encrypted DNS-enabled TCP Transport over the Mplex and Yamux protocols
-    let transport = libp2p::development_transport(local_key).await.unwrap();
+    let transport = libp2p::development_transport(local_key.clone())
+        .await
+        .unwrap();
 
-    // Create a Floodsub topic
-    let floodsub_topic = floodsub::Topic::new("chat");
-
-    // We create a custom network behaviour that combines floodsub and mDNS.
-    // In the future, we want to improve libp2p to make this easier to do.
-    // Use the derive to generate delegating NetworkBehaviour impl and require the
-    // NetworkBehaviourEventProcess implementations below.
-    #[derive(NetworkBehaviour)]
-    #[behaviour(out_event = "OutEvent")]
-    struct MyBehaviour {
-        floodsub: Floodsub,
-        mdns: Mdns,
-
-        // Struct fields which do not implement NetworkBehaviour need to be ignored
-        #[behaviour(ignore)]
-        #[allow(dead_code)]
-        ignored_member: bool,
-    }
-
-    #[derive(Debug)]
-    enum OutEvent {
-        Floodsub(FloodsubEvent),
-        Mdns(MdnsEvent),
-    }
-
-    impl From<MdnsEvent> for OutEvent {
-        fn from(v: MdnsEvent) -> Self {
-            Self::Mdns(v)
-        }
-    }
-
-    impl From<FloodsubEvent> for OutEvent {
-        fn from(v: FloodsubEvent) -> Self {
-            Self::Floodsub(v)
-        }
-    }
+    // Create a Gossipsub topic
+    let topic = Topic::new("new");
 
     // Create a Swarm to manage peers and events
     let mut swarm = {
-        let mdns = task::block_on(Mdns::new(MdnsConfig::default())).unwrap();
-        let mut behaviour = MyBehaviour {
-            floodsub: Floodsub::new(local_peer_id),
-            mdns,
-            ignored_member: false,
+        // To content-address message, we can take the hash of message and use it as an ID.
+        let message_id_fn = |message: &GossipsubMessage| {
+            let mut s = DefaultHasher::new();
+            message.data.hash(&mut s);
+            MessageId::from(s.finish().to_string())
         };
 
-        behaviour.floodsub.subscribe(floodsub_topic.clone());
-        Swarm::new(transport, behaviour, local_peer_id)
+        // Set a custom gossipsub
+        let gossipsub_config = gossipsub::GossipsubConfigBuilder::default()
+            .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
+            .validation_mode(ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message signing)
+            .message_id_fn(message_id_fn) // content-address messages. No two messages of the
+            // same content will be propagated.
+            .build()
+            .expect("Valid config");
+        // build a gossipsub network behaviour
+        let mut gossipsub: gossipsub::Gossipsub =
+            gossipsub::Gossipsub::new(MessageAuthenticity::Signed(local_key), gossipsub_config)
+                .expect("Correct configuration");
+
+        // subscribes to our topic
+        gossipsub.subscribe(&topic).unwrap();
+
+        // build the swarm
+        libp2p::Swarm::new(transport, gossipsub, local_peer_id)
     };
 
     // Listen on all interfaces and whatever port the OS assigns
@@ -223,51 +226,42 @@ async fn start(
 
     // Kick it off
     loop {
-        if let Ok(PacketFromFrontend::SendMessage((reciever, message))) = reciever.try_recv() {
-            swarm
-                .behaviour_mut()
-                .floodsub
-                .publish(floodsub::Topic::new(reciever), message)
-        }
         select! {
-            event = swarm.select_next_some() => match event {
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("Listening on {:?}", address);
-                }
-                SwarmEvent::Behaviour(OutEvent::Floodsub(
-                    FloodsubEvent::Message(message)
-                )) => {
-                    println!(
-                        "Received: '{:?}' from {:?}",
-                        String::from_utf8_lossy(&message.data),
-                        message.source
-                    );
-                    sender.send(PacketFromBackend::MessageRecieved((String::from("de"),String::from("dff")))).unwrap();
-                }
-                SwarmEvent::Behaviour(OutEvent::Mdns(
-                    MdnsEvent::Discovered(list)
-                )) => {
-                    for (peer, _) in list {
-                        swarm
-                            .behaviour_mut()
-                            .floodsub
-                            .add_node_to_partial_view(peer);
+                    packet = reciever.select_next_some() =>
+                {
+                match packet {
+                PacketFromFrontend::SendMessage((_, message)) => {
+                    swarm
+                        .behaviour_mut()
+                        .publish(topic.clone(), message).unwrap();
                     }
-                }
-                SwarmEvent::Behaviour(OutEvent::Mdns(MdnsEvent::Expired(
-                    list
-                ))) => {
-                    for (peer, _) in list {
-                        if !swarm.behaviour_mut().mdns.has_node(&peer) {
-                            swarm
-                                .behaviour_mut()
-                                .floodsub
-                                .remove_node_from_partial_view(&peer);
-                        }
+                    PacketFromFrontend::AddPeer(peer) => {
+
+                    let address: libp2p::Multiaddr = peer.parse().expect("User to provide valid address.");
+        match swarm.dial(address.clone()) {
+            Ok(_) => println!("Dialed {:?}", address),
+            Err(e) => println!("Dial {:?} failed: {:?}", address, e),
+        };
                     }
-                },
-                _ => {}
             }
-        }
+                }
+
+                    event = swarm.select_next_some() => match event {
+        SwarmEvent::Behaviour(GossipsubEvent::Message {
+                            propagation_source: peer_id,
+                            message_id: id,
+                            message,
+                        }) => println!(
+                            "Got message: {} with id: {} from peer: {:?}",
+                            String::from_utf8_lossy(&message.data),
+                            id,
+                            peer_id
+                        ),
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            println!("Listening on {:?}", address);
+                        }
+                        _ => {}
+                    }
+                }
     }
 }
