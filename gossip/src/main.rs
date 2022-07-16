@@ -1,4 +1,6 @@
-use eframe::egui::{self, RichText};
+use eframe::egui::style::Margin;
+use eframe::egui::{self, Button, RichText, TextEdit};
+use eframe::epaint::Color32;
 use futures::channel::mpsc;
 use futures::prelude::stream::StreamExt;
 use futures::select;
@@ -44,6 +46,7 @@ struct Message {
 #[derive(Default)]
 struct Chat {
     chat_name: String,
+    chat_peer_id: String,
     messages: Vec<Message>,
 }
 
@@ -53,6 +56,7 @@ struct MyApp {
     chats: Vec<Chat>,
     chat_index: usize,
     reciever: mpsc::Receiver<PacketFromBackend>,
+    frame: egui::Frame,
     sender: mpsc::Sender<PacketFromFrontend>,
 }
 
@@ -63,93 +67,138 @@ impl MyApp {
     ) -> Self {
         Self {
             draft_text: String::new(),
-            chats: vec![
-                Chat {
-                    chat_name: String::from("new"),
-                    messages: vec![Message {
-                        sender: String::from("de"),
-                        text: String::from("dejnjn"),
-                    }],
-                },
-                Chat {
-                    chat_name: String::from("news"),
-                    ..Default::default()
-                },
-            ],
+            chats: Vec::new(),
             chat_index: 0,
             sender,
             reciever,
             add_peer_text: String::new(),
+            frame: egui::Frame {
+                inner_margin: Margin {
+                    left: 10f32,
+                    right: 10f32,
+                    top: 10f32,
+                    bottom: 10f32,
+                },
+                fill: Color32::from_rgb(250, 250, 250),
+                ..Default::default()
+            },
         }
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Ok(Some(PacketFromBackend::MessageRecieved((room, message)))) =
+        if let Ok(Some(PacketFromBackend::MessageRecieved((peer, message)))) =
             self.reciever.try_next()
         {
+            if !self.chats.iter().any(|x| x.chat_peer_id == peer) {
+                self.chats.push(Chat {
+                    chat_name: String::from("new"),
+                    chat_peer_id: format!("{}", peer),
+                    messages: Vec::new(),
+                });
+            }
             self.chats
                 .iter_mut()
-                .find(|x| x.chat_name == room)
+                .find(|x| x.chat_peer_id == peer)
                 .unwrap()
                 .messages
                 .push(Message {
-                    sender: room,
+                    sender: peer,
                     text: message,
                 });
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Gossip");
-            ui.separator();
-            ui.horizontal(|ui| {
+        egui::TopBottomPanel::top("my_panel")
+            .frame(self.frame)
+            .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.set_height(ui.available_height());
-                    ui.group(|ui| {
-                        ui.vertical(|ui| {
-                            ui.label("Your decentralised chats:   ");
-                            for (i, chat) in self.chats.iter().enumerate() {
-                                ui.add_space(10f32);
-                                if ui
-                                    .button(
-                                        RichText::new(
-                                            String::from("🌝  ") + chat.chat_name.as_str(),
-                                        )
-                                        .heading(),
-                                    )
-                                    .clicked()
-                                {
-                                    self.chat_index = i;
-                                };
-                                ui.add_space(10f32);
-                            }
-                            ui.label("Add peer: ");
-                            ui.horizontal(|ui| {
-                                ui.text_edit_singleline(&mut self.add_peer_text);
+                    let style: egui::Style = (*ui.ctx().style()).clone();
+                    let visual = if style.visuals.dark_mode {
+                        if ui
+                            .add(Button::new("☀").frame(false))
+                            .on_hover_text("Switch to light mode")
+                            .clicked()
+                        {
+                            self.frame = self.frame.fill(Color32::from_rgb(250, 250, 250));
+                            egui::style::Visuals::light()
+                        } else {
+                            egui::style::Visuals::dark()
+                        }
+                    } else {
+                        if ui
+                            .add(Button::new("🌙").frame(false))
+                            .on_hover_text("Switch to dark mode")
+                            .clicked()
+                        {
+                            self.frame = self.frame.fill(Color32::from_rgb(25, 25, 25));
+                            egui::style::Visuals::dark()
+                        } else {
+                            egui::style::Visuals::light()
+                        }
+                    };
+                    ui.ctx().set_visuals(visual);
+                    ui.heading("Gossip");
+                });
+                ui.separator();
+            });
+        egui::SidePanel::left("left panel")
+            .resizable(false)
+            .frame(self.frame)
+            .show(ctx, |ui| {
+                ui.group(|ui| {
+                    if self.chats.is_empty() {
+                        ui.label("You have no decentralised chats, you lonely loser you. Add one below. ");
+                    } else {
+                        ui.label("Your decentralised chats: ");
+                    }
+                    ui.add_space(10f32);
+                    for (i, chat) in self.chats.iter().enumerate() {
+                        if ui
+                            .add_sized(
+                                eframe::emath::Vec2 {
+                                    x: ui.available_width(),
+                                    y: 0f32,
+                                },
+                                Button::new(RichText::new(
+                                    String::from("🌝  ") + chat.chat_name.as_str(),
+                                )),
+                            )
+                            .clicked()
+                        {
+                            self.chat_index = i;
+                        };
+                    }
+                    ui.add_space(10f32);
+                    ui.label("Add peer: ");
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.add_peer_text);
 
-                                if ui.button(String::from("+")).clicked() {
-                                    self.sender
-                                        .try_send(PacketFromFrontend::AddPeer(
-                                            self.add_peer_text.clone(),
-                                        ))
-                                        .unwrap();
-                                    self.add_peer_text.clear();
-                                };
-                            })
-                        })
-                    });
-                    ui.group(|ui| {
-                        ui.vertical(|ui| {
+                        if ui.button(String::from("+")).clicked() {
+                            self.sender
+                                .try_send(PacketFromFrontend::AddPeer(self.add_peer_text.clone()))
+                                .unwrap();
+                            self.chats.push(Chat { chat_name: String::from("new"), chat_peer_id: self.add_peer_text.clone().split('/').last().unwrap().to_string(), messages: Vec::new() });
+                            self.add_peer_text.clear();
+                        };
+                    })
+                })
+            });
+        egui::CentralPanel::default()
+            .frame(self.frame)
+            .show(ctx, |ui| {
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        if !self.chats.is_empty() {
                             for message in &self.chats[self.chat_index].messages {
                                 ui.group(|ui| {
                                     ui.label(RichText::new(&message.sender).heading());
                                     ui.label(&message.text);
                                 });
                             }
-                            ui.add_space(10f32);
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.text_edit_singleline(&mut self.draft_text);
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.add_enabled_ui(!self.chats.is_empty(), |ui| {
                                 if ui.button("Send").clicked() {
                                     self.sender
                                         .try_send(PacketFromFrontend::SendMessage((
@@ -157,15 +206,21 @@ impl eframe::App for MyApp {
                                             self.draft_text.clone(),
                                         )))
                                         .unwrap();
+                                    self.chats[self.chat_index].messages.push(Message {
+                                        sender: String::from("me"),
+                                        text: self.draft_text.clone(),
+                                    });
                                     //.unwrap_or(println!("Error sending!"));
                                     self.draft_text.clear();
                                 }
-                            })
+                            });
+                            TextEdit::singleline(&mut self.draft_text)
+                                .desired_width(f32::INFINITY)
+                                .show(ui);
                         })
                     })
                 })
             });
-        });
     }
 }
 
@@ -251,14 +306,17 @@ async fn start(
                             propagation_source: peer_id,
                             message_id: id,
                             message,
-                        }) => println!(
+                        }) => {
+                        println!(
                             "Got message: {} with id: {} from peer: {:?}",
                             String::from_utf8_lossy(&message.data),
                             id,
                             peer_id
-                        ),
+                        );
+                       sender.try_send(PacketFromBackend::MessageRecieved((format!("{}",peer_id), String::from_utf8_lossy(&message.data).to_string()))).unwrap();
+                    }
                         SwarmEvent::NewListenAddr { address, .. } => {
-                            println!("Listening on {:?}", address);
+                            println!("Listening on {}/p2p/{}", address, local_peer_id);
                         }
                         _ => {}
                     }
