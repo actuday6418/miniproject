@@ -10,3 +10,7 @@ libp2p = { version = "*", features = ["mdns"] }
 futures = "*"
 async-std = "*"
 eframe = "*"
+nokhwa = "*"
+qrcode-generator = "4.1.6"
+egui_extras = { version = "*", features = ["image"] }
+image = { version = "*", default-features = false, features = ["png"] }

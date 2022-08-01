@@ -1,9 +1,12 @@
+use crate::egui::TextureHandle;
 use eframe::egui::style::Margin;
 use eframe::egui::{self, Button, RichText, TextEdit};
 use eframe::epaint::Color32;
+use egui_extras::image::RetainedImage;
 use futures::channel::mpsc;
 use futures::prelude::stream::StreamExt;
 use futures::select;
+use image::DynamicImage;
 
 use libp2p::gossipsub::MessageId;
 use libp2p::gossipsub::{
@@ -16,9 +19,9 @@ use std::time::Duration;
 
 fn main() {
     // frontend to backend
-    let (mut f_sender, mut f_reciever) = mpsc::channel(128);
+    let (f_sender, mut f_reciever) = mpsc::channel(128);
     // backend to front
-    let (mut b_sender, mut b_reciever) = mpsc::channel(128);
+    let (mut b_sender, b_reciever) = mpsc::channel(128);
     std::thread::spawn(move || async_std::task::block_on(start(&mut f_reciever, &mut b_sender)));
     eframe::run_native(
         "Gossip",
@@ -30,6 +33,7 @@ fn main() {
 /// used for internal communication from networking to frontend
 enum PacketFromBackend {
     MessageRecieved((String, String)),
+    AddListenID(String),
 }
 
 ///used for internal communication from frontend to networking
@@ -55,10 +59,14 @@ struct MyApp {
     add_peer_text: String,
     chats: Vec<Chat>,
     chat_index: usize,
+    show_qr: Option<RetainedImage>,
     reciever: mpsc::Receiver<PacketFromBackend>,
     frame: egui::Frame,
     sender: mpsc::Sender<PacketFromFrontend>,
+    listener_string: String,
 }
+use image::ImageEncoder;
+use image::{codecs::png::PngEncoder, ImageBuffer, Pixel};
 
 impl MyApp {
     fn new(
@@ -82,31 +90,38 @@ impl MyApp {
                 fill: Color32::from_rgb(250, 250, 250),
                 ..Default::default()
             },
+            show_qr: None,
+            listener_string: String::new(),
         }
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Ok(Some(PacketFromBackend::MessageRecieved((peer, message)))) =
-            self.reciever.try_next()
-        {
-            if !self.chats.iter().any(|x| x.chat_peer_id == peer) {
-                self.chats.push(Chat {
-                    chat_name: String::from("new"),
-                    chat_peer_id: format!("{}", peer),
-                    messages: Vec::new(),
-                });
+        match self.reciever.try_next() {
+            Ok(Some(PacketFromBackend::MessageRecieved((peer, message)))) => {
+                if !self.chats.iter().any(|x| x.chat_peer_id == peer) {
+                    self.chats.push(Chat {
+                        chat_name: String::from("new"),
+                        chat_peer_id: format!("{}", peer),
+                        messages: Vec::new(),
+                    });
+                }
+                self.chats
+                    .iter_mut()
+                    .find(|x| x.chat_peer_id == peer)
+                    .unwrap()
+                    .messages
+                    .push(Message {
+                        sender: peer,
+                        text: message,
+                    });
             }
-            self.chats
-                .iter_mut()
-                .find(|x| x.chat_peer_id == peer)
-                .unwrap()
-                .messages
-                .push(Message {
-                    sender: peer,
-                    text: message,
-                });
+            Ok(Some(PacketFromBackend::AddListenID(id))) => {
+                self.listener_string.push_str(id.as_str());
+                self.listener_string.push(',');
+            }
+            _ => {}
         }
         egui::TopBottomPanel::top("my_panel")
             .frame(self.frame)
@@ -180,7 +195,14 @@ impl eframe::App for MyApp {
                             self.chats.push(Chat { chat_name: String::from("new"), chat_peer_id: self.add_peer_text.clone().split('/').last().unwrap().to_string(), messages: Vec::new() });
                             self.add_peer_text.clear();
                         };
-                    })
+                        if ui.button(String::from("qr")).clicked() {use qrcode_generator::QrCodeEcc;
+let img = qrcode_generator::to_png_to_vec("Hello world!", QrCodeEcc::Low, 1024).unwrap();
+                           self.show_qr = Some(RetainedImage::from_image_bytes( String::from("qr"),&img).unwrap());
+                        }
+                    });
+                    if self.show_qr.is_some() {
+                        self.show_qr.as_ref().unwrap().show_scaled(ui,0.1);
+                    }
                 })
             });
         egui::CentralPanel::default()
@@ -223,10 +245,6 @@ impl eframe::App for MyApp {
             });
     }
 }
-
-//fn main() {
-//   task::block_on(start());
-//}
 
 async fn start(
     reciever: &mut mpsc::Receiver<PacketFromFrontend>,
